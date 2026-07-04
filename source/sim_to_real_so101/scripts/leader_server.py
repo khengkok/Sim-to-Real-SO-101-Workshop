@@ -15,8 +15,17 @@
 """Local leader-arm server.
 
 Runs on the machine that the physical SO-101 *leader* arm is plugged into.
-It opens the arm through LeRobot and exposes its joint readings over a ZeroMQ
-REP socket so a remote Isaac Sim process can teleoperate the sim over the network.
+It opens the arm through LeRobot and exposes its joint readings over ZeroMQ so a
+remote Isaac Sim process can teleoperate the sim over the network.
+
+Two transports are supported (``--transport``):
+
+- ``reqrep`` (default): a REQ/REP socket. The sim requests a reading each step and
+  the server replies. Simple, supports an optional API token, but every step pays a
+  full network round-trip.
+- ``pubsub``: a PUB socket that continuously publishes the latest reading at
+  ``--rate`` Hz. The sim grabs the freshest sample without a per-step round-trip,
+  giving lower latency over a high-latency link. One-directional, so no API token.
 
 Only the six joint values (a small dict of floats) cross the network; the chatty
 Feetech serial traffic stays local, so WAN latency does not stall the servo bus.
@@ -25,16 +34,48 @@ Requires only `pyzmq`, `msgpack`, and `lerobot` locally -- no Isaac Sim / GPU.
 
 Example:
     python leader_server.py --port /dev/ttyACM0 --robot_id leader_arm_1 \
-        --host 0.0.0.0 --zmq_port 5556
+        --host 0.0.0.0 --zmq_port 5556 --transport pubsub --rate 100
 """
 import argparse
 import os
+import time
 
 import msgpack
 import zmq
 
 from lerobot.robots import make_robot_from_config
 from lerobot.teleoperators.so101_leader import SO101LeaderConfig
+
+
+def read_action(robot) -> dict:
+    """Read the leader arm and cast to plain floats so msgpack can serialize it."""
+    return {k: float(v) for k, v in robot.get_action().items()}
+
+
+def serve_reqrep(robot, socket, api_token):
+    """Reply with a fresh reading on each request."""
+    while True:
+        request = msgpack.unpackb(socket.recv())
+
+        if api_token and request.get("api_token") != api_token:
+            socket.send(msgpack.packb({"error": "unauthorized"}))
+            continue
+
+        endpoint = request.get("endpoint", "get_action")
+        if endpoint == "ping":
+            socket.send(msgpack.packb({"status": "ok"}))
+        elif endpoint == "get_action":
+            socket.send(msgpack.packb(read_action(robot)))
+        else:
+            socket.send(msgpack.packb({"error": f"unknown endpoint: {endpoint}"}))
+
+
+def serve_pubsub(robot, socket, rate):
+    """Continuously publish the latest reading at ``rate`` Hz."""
+    period = 1.0 / rate
+    while True:
+        socket.send(msgpack.packb(read_action(robot)))
+        time.sleep(period)
 
 
 def main():
@@ -56,10 +97,22 @@ def main():
     )
     parser.add_argument("--zmq_port", type=int, default=5556, help="TCP port to listen on.")
     parser.add_argument(
+        "--transport",
+        choices=["reqrep", "pubsub"],
+        default="reqrep",
+        help="reqrep = request/reply (round-trip per step); pubsub = stream latest reading.",
+    )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=100.0,
+        help="Publish rate in Hz (pubsub only).",
+    )
+    parser.add_argument(
         "--api_token",
         type=str,
         default=os.getenv("LEADER_API_TOKEN", None),
-        help="Optional shared secret; clients must present the same token.",
+        help="Optional shared secret (reqrep only); clients must present the same token.",
     )
     args = parser.parse_args()
 
@@ -70,30 +123,19 @@ def main():
     print(f"[INFO]: Connected to leader arm at {args.port} (id={args.robot_id})")
 
     context = zmq.Context()
-    socket = context.socket(zmq.REP)
+    socket_type = zmq.REP if args.transport == "reqrep" else zmq.PUB
+    socket = context.socket(socket_type)
     socket.bind(f"tcp://{args.host}:{args.zmq_port}")
-    print(f"[INFO]: Leader server listening on tcp://{args.host}:{args.zmq_port}")
+    print(
+        f"[INFO]: Leader server ({args.transport}) listening on "
+        f"tcp://{args.host}:{args.zmq_port}"
+    )
 
     try:
-        while True:
-            request = msgpack.unpackb(socket.recv())
-
-            # Optional shared-secret check.
-            if args.api_token and request.get("api_token") != args.api_token:
-                socket.send(msgpack.packb({"error": "unauthorized"}))
-                continue
-
-            endpoint = request.get("endpoint", "get_action")
-
-            if endpoint == "ping":
-                socket.send(msgpack.packb({"status": "ok"}))
-            elif endpoint == "get_action":
-                # get_action() returns e.g. {"shoulder_pan.pos": 12.3, ..., "gripper.pos": 45.0}.
-                # Cast to plain floats so msgpack can serialize numpy scalars.
-                action = {k: float(v) for k, v in robot.get_action().items()}
-                socket.send(msgpack.packb(action))
-            else:
-                socket.send(msgpack.packb({"error": f"unknown endpoint: {endpoint}"}))
+        if args.transport == "reqrep":
+            serve_reqrep(robot, socket, args.api_token)
+        else:
+            serve_pubsub(robot, socket, args.rate)
     except KeyboardInterrupt:
         print("\n[INFO]: Shutting down leader server.")
     finally:

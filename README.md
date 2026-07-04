@@ -170,12 +170,49 @@ lerobot_agent \
 Recording (`--repo_id …`, `S` key) works unchanged: camera frames are rendered inside the
 sim on the cloud and never depended on the local hardware.
 
+### Lower latency: `pubsub` transport
+
+The default `reqrep` transport makes one network **round-trip per simulation step**, so a
+high round-trip time lowers the effective teleop frame rate. Over a high-latency link, use
+the `pubsub` transport instead: the leader server continuously publishes the latest reading
+and the sim grabs the freshest sample without a per-step round-trip (only the newest sample
+is kept, so no lag builds up).
+
+On the local machine, add `--transport pubsub` (optionally `--rate`, publish Hz):
+
+```bash
+python source/sim_to_real_so101/scripts/leader_server.py \
+    --port /dev/ttyACM0 --robot_id leader_arm_1 \
+    --host 0.0.0.0 --zmq_port 5556 --transport pubsub --rate 100
+```
+
+On the cloud, add `--leader_transport pubsub`:
+
+```bash
+lerobot_agent \
+    --task Lerobot-So101-Teleop-Base \
+    --remote_leader --leader_host localhost --leader_zmq_port 5556 \
+    --leader_transport pubsub
+```
+
+The transport must match on both ends.
+
+### Sanity-check the bridge
+
+Before involving the real arm and cloud sim, verify the ZMQ/msgpack wiring locally with
+the loopback test. It runs a mock leader server on `127.0.0.1` (no arm, no `lerobot`
+needed — only `pyzmq` and `msgpack`) and exercises the client over both transports:
+
+```bash
+python source/sim_to_real_so101/scripts/leader_loopback_test.py
+```
+
+It prints a `PASS`/`FAIL` line per check and exits non-zero if anything fails.
+
 > **Notes**
-> - **Latency caps the rate.** The loop makes one network round-trip per simulation
->   step, so a high round-trip time lowers the effective teleop frame rate. A tunnel over
->   a low-latency link keeps it usable.
-> - **Security.** If you cannot use an SSH tunnel and must expose the port directly, set a
->   shared secret via `--api_token` on the server and `LEADER_API_TOKEN` on the client.
+> - **Security.** `pubsub` is one-directional and does not support the API token — rely on
+>   the SSH tunnel. If you use `reqrep` and must expose the port directly, set a shared
+>   secret via `--api_token` on the server and `LEADER_API_TOKEN` on the client.
 
 ## Models and Datasets
 
@@ -213,6 +250,7 @@ You can either download them ahead of time, or as you get to them in the course.
   - `--remote_leader` - Read the leader arm from a remote `leader_server.py` instead of a local serial port (see [Remote Teleoperation](#remote-teleoperation))
   - `--leader_host` - Host of the remote leader server; required with `--remote_leader` (env: `LEADER_HOST`)
   - `--leader_zmq_port` - TCP port of the remote leader server, default `5556` (env: `LEADER_ZMQ_PORT`)
+  - `--leader_transport` - `reqrep` (default, round-trip per step) or `pubsub` (lower latency); must match the server's `--transport` (env: `LEADER_TRANSPORT`)
 - `lerobot_eval` - Model evaluation script
 - `lerobot_push_dataset` - LeRobot Dataset push to hub script
 

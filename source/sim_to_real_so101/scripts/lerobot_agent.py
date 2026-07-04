@@ -59,6 +59,12 @@ parser.add_argument(
     help="TCP port of the remote leader server.",
 )
 parser.add_argument(
+    "--leader_transport",
+    choices=["reqrep", "pubsub"],
+    default=os.getenv("LEADER_TRANSPORT", "reqrep"),
+    help="Transport to the remote leader server: reqrep (round-trip per step) or pubsub (lower latency).",
+)
+parser.add_argument(
     "--repo_id", type=str, default=None, help="Repository ID to store the dataset."
 )
 parser.add_argument(
@@ -168,6 +174,7 @@ def main():
         leader_client = RemoteLeaderClient(
             host=args_cli.leader_host,
             port=args_cli.leader_zmq_port,
+            transport=args_cli.leader_transport,
             api_token=os.getenv("LEADER_API_TOKEN", None),
         )
         if not leader_client.ping():
