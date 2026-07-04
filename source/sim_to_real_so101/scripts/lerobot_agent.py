@@ -41,6 +41,24 @@ parser.add_argument(
     help="ID of the robot.",
 )
 parser.add_argument(
+    "--remote_leader",
+    action="store_true",
+    default=False,
+    help="Read the leader arm from a remote leader_server.py instead of a local serial port.",
+)
+parser.add_argument(
+    "--leader_host",
+    type=str,
+    default=os.getenv("LEADER_HOST", None),
+    help="Host of the remote leader server (required with --remote_leader).",
+)
+parser.add_argument(
+    "--leader_zmq_port",
+    type=int,
+    default=int(os.getenv("LEADER_ZMQ_PORT", "5556")),
+    help="TCP port of the remote leader server.",
+)
+parser.add_argument(
     "--repo_id", type=str, default=None, help="Repository ID to store the dataset."
 )
 parser.add_argument(
@@ -138,8 +156,29 @@ def main():
         fps=30,
         kind="leader",
     )
-    robot_iface.init_device()
-    robot_iface.connect()
+
+    # The leader arm can live on a remote (local) machine while the sim runs here.
+    # In that case we skip opening a local serial device and pull joints over ZMQ.
+    # robot_iface is still used for the real->sim joint mapping (pure math, no hardware).
+    if args_cli.remote_leader:
+        from sim_to_real_so101.utils.remote_leader import RemoteLeaderClient
+
+        if not args_cli.leader_host:
+            raise ValueError("--remote_leader requires --leader_host (or $LEADER_HOST)")
+        leader_client = RemoteLeaderClient(
+            host=args_cli.leader_host,
+            port=args_cli.leader_zmq_port,
+            api_token=os.getenv("LEADER_API_TOKEN", None),
+        )
+        if not leader_client.ping():
+            raise RuntimeError(
+                f"Cannot reach leader server at {args_cli.leader_host}:{args_cli.leader_zmq_port}"
+            )
+        print(f"[INFO]: Using remote leader arm at {args_cli.leader_host}:{args_cli.leader_zmq_port}")
+    else:
+        leader_client = None
+        robot_iface.init_device()
+        robot_iface.connect()
 
     # Allocate action tensor
     actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
@@ -174,7 +213,10 @@ def main():
     while simulation_app.is_running():
         # run everything in inference mode
         with torch.inference_mode():
-            real_action = robot_iface.robot.get_action()
+            if leader_client is not None:
+                real_action = leader_client.get_action()
+            else:
+                real_action = robot_iface.robot.get_action()
             real_action, mapped_action = robot_iface.real_to_sim_obs_processor(
                 real_action
             )
